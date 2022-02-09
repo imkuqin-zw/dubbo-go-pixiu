@@ -56,6 +56,16 @@ func (f *Filter) initFromFileDescriptor(importPaths []string, fileNames ...strin
 	for _, fd := range fds {
 		name := fd.GetName()
 		fsrc.files[name] = fd
+		for _, svr := range fd.GetServices() {
+			for _, meth := range svr.GetMethods() {
+				if err := f.registerExtension(meth); err != nil {
+					return err
+				}
+				if err := initServiceRouter(f, meth); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	return nil

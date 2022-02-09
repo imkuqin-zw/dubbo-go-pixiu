@@ -18,7 +18,7 @@
 package grpcproxy
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -27,6 +27,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/julienschmidt/httprouter"
 )
 
 import (
@@ -34,9 +36,7 @@ import (
 	"github.com/golang/protobuf/proto"  //nolint
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
-	"github.com/jhump/protoreflect/dynamic/grpcdynamic"
 	perrors "github.com/pkg/errors"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -47,7 +47,6 @@ import (
 	"github.com/apache/dubbo-go-pixiu/pkg/common/extension/filter"
 	"github.com/apache/dubbo-go-pixiu/pkg/context/http"
 	"github.com/apache/dubbo-go-pixiu/pkg/logger"
-	"github.com/apache/dubbo-go-pixiu/pkg/server"
 )
 
 const (
@@ -78,6 +77,8 @@ type (
 
 		extReg     dynamic.ExtensionRegistry
 		registered map[string]bool
+
+		router *httprouter.Router
 	}
 
 	// Config describe the config of AccessFilter
@@ -101,7 +102,7 @@ func (p *Plugin) Kind() string {
 }
 
 func (p *Plugin) CreateFilter() (filter.HttpFilter, error) {
-	return &Filter{cfg: &Config{}}, nil
+	return &Filter{cfg: &Config{}, router: httprouter.New()}, nil
 }
 
 func (f *Filter) PrepareFilterChain(ctx *http.HttpContext) error {
@@ -130,115 +131,8 @@ func getServiceAndMethod(path string) (string, string) {
 
 // Handle use the default http to grpc transcoding strategy https://cloud.google.com/endpoints/docs/grpc/transcoding
 func (f *Filter) Handle(c *http.HttpContext) {
-	svc, mth := getServiceAndMethod(c.GetUrl())
-
-	dscp, err := fsrc.FindSymbol(svc)
-	if err != nil {
-		logger.Errorf("%s err {%s}", loggerHeader, "request path invalid")
-		c.Err = perrors.New("method not allow")
-		c.Next()
-		return
-	}
-
-	svcDesc, ok := dscp.(*desc.ServiceDescriptor)
-	if !ok {
-		logger.Errorf("%s err {service not expose, %s}", loggerHeader, svc)
-		c.Err = perrors.New(fmt.Sprintf("service not expose, %s", svc))
-		c.Next()
-		return
-	}
-
-	mthDesc := svcDesc.FindMethodByName(mth)
-
-	err = f.registerExtension(mthDesc)
-	if err != nil {
-		logger.Errorf("%s err {%s}", loggerHeader, "register extension failed")
-		c.Err = err
-		c.Next()
-		return
-	}
-
-	msgFac := dynamic.NewMessageFactoryWithExtensionRegistry(&f.extReg)
-	grpcReq := msgFac.NewMessage(mthDesc.GetInputType())
-
-	err = jsonToProtoMsg(c.Request.Body, grpcReq)
-	if err != nil && !errors.Is(err, io.EOF) {
-		logger.Errorf("%s err {failed to convert json to proto msg, %s}", loggerHeader, err.Error())
-		c.Err = err
-		c.Next()
-		return
-	}
-
-	var clientConn *grpc.ClientConn
-	re := c.GetRouteEntry()
-	logger.Debugf("%s client choose endpoint from cluster :%v", loggerHeader, re.Cluster)
-
-	e := server.GetClusterManager().PickEndpoint(re.Cluster)
-	if e == nil {
-		logger.Errorf("%s err {cluster not exists}", loggerHeader)
-		c.Err = perrors.New("cluster not exists")
-		c.Next()
-		return
-	}
-
-	ep := e.Address.GetAddress()
-
-	p, ok := f.pools[strings.Join([]string{re.Cluster, ep}, ".")]
-	if !ok {
-		p = &sync.Pool{}
-	}
-
-	clientConn, ok = p.Get().(*grpc.ClientConn)
-	if !ok || clientConn == nil {
-		// TODO(Kenway): Support Credential and TLS
-		clientConn, err = grpc.DialContext(c.Ctx, ep, grpc.WithInsecure())
-		if err != nil || clientConn == nil {
-			logger.Errorf("%s err {failed to connect to grpc service provider}", loggerHeader)
-			c.Err = err
-			c.Next()
-			return
-		}
-	}
-
-	stub := grpcdynamic.NewStubWithMessageFactory(clientConn, msgFac)
-
-	// metadata in grpc has the same feature in http
-	md := mapHeaderToMetadata(c.AllHeaders())
-	ctx := metadata.NewOutgoingContext(c.Ctx, md)
-
-	md = metadata.MD{}
-	t := metadata.MD{}
-
-	resp, err := Invoke(ctx, stub, mthDesc, grpcReq, grpc.Header(&md), grpc.Trailer(&t))
-	// judge err is server side error or not
-	if st, ok := status.FromError(err); !ok || isServerError(st) {
-		logger.Error("%s err {failed to invoke grpc service provider, %s}", loggerHeader, err.Error())
-		c.Err = err
-		c.Next()
-		return
-	}
-
-	res, err := protoMsgToJson(resp)
-	if err != nil {
-		logger.Error("%s err {failed to convert proto msg to json, %s}", loggerHeader, err.Error())
-		c.Err = err
-		c.Next()
-		return
-	}
-
-	h := mapMetadataToHeader(md)
-	th := mapMetadataToHeader(t)
-
-	// let response filter handle resp
-	c.SourceResp = &stdHttp.Response{
-		StatusCode: stdHttp.StatusOK,
-		Header:     h,
-		Body:       ioutil.NopCloser(strings.NewReader(res)),
-		Trailer:    th,
-		Request:    c.Request,
-	}
-	p.Put(clientConn)
-	c.Next()
+	req := c.Request.WithContext(context.WithValue(c.Request.Context(), httpContextKey{}, c))
+	f.router.ServeHTTP(c.Writer, req)
 }
 
 func (f *Filter) registerExtension(mthDesc *desc.MethodDescriptor) error {
